@@ -1,0 +1,146 @@
+To run this code on Windows, you'll need to:
+
+1. Install the libraries with MSYS2 (easiest approach)
+2. Modify the code for Windows-specific paths
+3. Compile with gcc in the MSYS2 environment
+
+## Setup MSYS2 and Dependencies
+
+1. Download and install MSYS2 from https://www.msys2.org/
+2. Open the MSYS2 MinGW 64-bit terminal
+3. Update the package database:
+   ```bash
+   pacman -Syu
+   ```
+4. Install the required libraries:
+   ```bash
+   pacman -S mingw-w64-x86_64-gcc
+   pacman -S mingw-w64-x86_64-pkg-config
+   pacman -S mingw-w64-x86_64-poppler
+   pacman -S mingw-w64-x86_64-cairo
+   pacman -S mingw-w64-x86_64-tesseract-ocr
+   pacman -S mingw-w64-x86_64-leptonica
+   ```
+5. Install Tesseract language data:
+   ```bash
+   pacman -S mingw-w64-x86_64-tesseract-data-eng
+   ```
+
+## Modify the Code for Windows
+
+```c
+#include <poppler/glib/poppler.h>
+#include <cairo.h>
+#include <tesseract/capi.h>
+#include <leptonica/allheaders.h>
+#include <glib.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <direct.h>  // For _mkdir on Windows
+
+static void mkdir_p(const char *path) {
+    // Windows directory creation
+    _mkdir(path);  // On Windows, returns 0 on success
+}
+
+// Rest of the code remains the same
+void extract_pdf_text_and_images(const char *pdf_path,
+                                 const char *out_txt,
+                                 const char *img_dir)
+{
+    GError *err = NULL;
+    gchar *uri = g_filename_to_uri(pdf_path, NULL, &err);
+    if (!uri) {
+        fprintf(stderr, "URI error: %s\n", err->message);
+        return;
+    }
+
+    PopplerDocument *doc = poppler_document_new_from_file(uri, NULL, &err);
+    g_free(uri);
+    if (!doc) {
+        fprintf(stderr, "PDF open error: %s\n", err->message);
+        return;
+    }
+
+    mkdir_p(img_dir);
+    FILE *f = fopen(out_txt, "w");
+    int n_pages = poppler_document_get_n_pages(doc);
+
+    for (int p = 0; p < n_pages; ++p) {
+        PopplerPage *page = poppler_document_get_page(doc, p);
+
+        // 1) PDF text layer
+        gchar *txt = poppler_page_get_text(page);
+        if (txt && *txt) {
+            fprintf(f, "%s\n", txt);
+        }
+        g_free(txt);
+
+        // 2) Extract images
+        GList *maps = poppler_page_get_image_mapping(page);
+
+        int img_idx = 1;
+        for (GList *l = maps; l; l = l->next, ++img_idx) {
+            PopplerImageMapping *m = (PopplerImageMapping*)l->data;
+            // grab the image as a Cairo surface
+            cairo_surface_t *surface =
+                poppler_page_get_image(page, m->image_id);
+            gchar *fname = g_strdup_printf("%s\\page%d_img%d.png",
+                                           img_dir, p+1, img_idx);  // Windows path separator
+            // save surface to PNG
+            cairo_surface_write_to_png(surface, fname);
+            cairo_surface_destroy(surface);
+
+            // 3) OCR via Leptonica + Tesseract
+            PIX *pix = pixRead(fname);
+            TessBaseAPI *tess = TessBaseAPICreate();
+            if (TessBaseAPIInit3(tess, NULL, "eng") == 0) {
+                TessBaseAPISetImage2(tess, pix);
+                char *ocr = TessBaseAPIGetUTF8Text(tess);
+                if (ocr && *ocr) {
+                    fprintf(f, "%s\n", ocr);
+                }
+                TessDeleteText(ocr);
+            }
+            TessBaseAPIDelete(tess);
+            pixDestroy(&pix);
+            remove(fname);  // Clean up temp file
+            g_free(fname);
+        }
+        g_list_free_full(maps, (GDestroyNotify)poppler_image_mapping_free);
+        g_object_unref(page);
+    }
+
+    fclose(f);
+    g_object_unref(doc);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 4) {
+        fprintf(stderr, "Usage: %s input.pdf output.txt image_folder\n", argv[0]);
+        return 1;
+    }
+    extract_pdf_text_and_images(argv[1], argv[2], argv[3]);
+    return 0;
+}
+```
+
+## Compile on Windows
+
+In the MSYS2 MinGW terminal:
+
+```bash
+gcc pdf_extract_win.c -o pdf_extract.exe \
+  `pkg-config --cflags --libs poppler-glib cairo glib-2.0 gobject-2.0 lept tesseract`
+```
+
+## Run the Program
+
+In Windows command prompt or PowerShell:
+
+```
+pdf_extract.exe C:\path\to\your.pdf C:\path\to\output.txt C:\path\to\temp_folder
+```
+
+The executable should be in your MSYS2 MinGW bin directory, or you can copy it elsewhere.
