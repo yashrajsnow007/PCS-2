@@ -1,0 +1,117 @@
+#include <poppler/glib/poppler.h>
+#include <cairo.h>
+#include <tesseract/capi.h>
+#include <leptonica/allheaders.h>
+#include <glib.h>
+#include <stdio.h>
+#include <string.h>
+
+// Platform-specific includes and definitions
+#ifdef _WIN32
+    #include <windows.h>
+    #define PATH_SEP "\\"
+#else
+    #include <sys/stat.h>
+    #define PATH_SEP "/"
+#endif
+
+static void mkdir_p(const char *path) {
+    // GLib's directory creation is cross-platform
+    if (!g_file_test(path, G_FILE_TEST_IS_DIR))
+        g_mkdir_with_parents(path, 0755);
+}
+
+void extract_pdf_text_and_images(const char *pdf_path,
+                                 const char *out_txt,
+                                 const char *img_dir)
+{
+    GError *err = NULL;
+    gchar *uri = g_filename_to_uri(pdf_path, NULL, &err);
+    if (!uri) {
+        fprintf(stderr, "URI error: %s\n", err->message);
+        return;
+    }
+
+    PopplerDocument *doc = poppler_document_new_from_file(uri, NULL, &err);
+    g_free(uri);
+    if (!doc) {
+        fprintf(stderr, "PDF open error: %s\n", err->message);
+        return;
+    }
+
+    mkdir_p(img_dir);
+    FILE *f = fopen(out_txt, "w");
+    int n_pages = poppler_document_get_n_pages(doc);
+
+    for (int p = 0; p < n_pages; ++p) {
+        fprintf(f, "\n\n=== Page %d ===\n", p+1);
+        PopplerPage *page = poppler_document_get_page(doc, p);
+
+        // 1) PDF text layer
+        gchar *txt = poppler_page_get_text(page);
+        if (txt && *txt) {
+            fprintf(f, "PDF layer text:\n%s\n", txt);
+        } else {
+            fprintf(f, "PDF layer text: <none>\n");
+        }
+        g_free(txt);
+
+        // 2) Extract images
+        GList *maps = poppler_page_get_image_mapping(page);
+        fprintf(f, "Images found on page: %d\n", g_list_length(maps));
+
+        int img_idx = 1;
+        for (GList *l = maps; l; l = l->next, ++img_idx) {
+            PopplerImageMapping *m = (PopplerImageMapping*)l->data;
+            // grab the image as a Cairo surface
+            cairo_surface_t *surface =
+                poppler_page_get_image(page, m->image_id);
+                
+            // Use platform-independent path construction
+            gchar *fname = g_strdup_printf("%s%spage%d_img%d.png",
+                                           img_dir, PATH_SEP, p+1, img_idx);
+            // save surface to PNG
+            cairo_surface_write_to_png(surface, fname);
+            cairo_surface_destroy(surface);
+            fprintf(f, "  [%d] saved to %s\n", img_idx, fname);
+
+            // 3) OCR via Leptonica + Tesseract
+            PIX *pix = pixRead(fname);
+            TessBaseAPI *tess = TessBaseAPICreate();
+            if (TessBaseAPIInit3(tess, NULL, "eng") == 0) {
+                TessBaseAPISetImage2(tess, pix);
+                char *ocr = TessBaseAPIGetUTF8Text(tess);
+                if (ocr && *ocr) {
+                    fprintf(f, "    OCR text:\n");
+                    // We need to manually split by newlines since strtok modifies the string
+                    char *ocr_copy = strdup(ocr);
+                    for (char *ln = strtok(ocr_copy, "\n"); ln; ln = strtok(NULL, "\n"))
+                        fprintf(f, "      %s\n", ln);
+                    free(ocr_copy);
+                } else {
+                    fprintf(f, "    OCR text: <none detected>\n");
+                }
+                TessDeleteText(ocr);
+            } else {
+                fprintf(stderr, "Tesseract init failed\n");
+            }
+            TessBaseAPIDelete(tess);
+            pixDestroy(&pix);
+            g_free(fname);
+        }
+        g_list_free_full(maps, (GDestroyNotify)poppler_image_mapping_free);
+        g_object_unref(page);
+    }
+
+    fclose(f);
+    g_object_unref(doc);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 4) {
+        fprintf(stderr, "Usage: %s input.pdf output.txt image_folder\n", argv[0]);
+        return 1;
+    }
+    extract_pdf_text_and_images(argv[1], argv[2], argv[3]);
+    return 0;
+}
